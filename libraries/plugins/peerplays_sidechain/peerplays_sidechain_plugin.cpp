@@ -116,21 +116,21 @@ peerplays_sidechain_plugin_impl::peerplays_sidechain_plugin_impl(peerplays_sidec
       sidechain_enabled_peerplays(false),
       current_son_id([] {
          std::map<sidechain_type, son_id_type> current_son_id;
-         for (const auto &active_sidechain_type : active_sidechain_types) {
+         for (const auto &active_sidechain_type : all_sidechain_types) {
             current_son_id.emplace(active_sidechain_type, son_id_type(std::numeric_limits<uint32_t>().max()));
          }
          return current_son_id;
       }()),
       sidechain_enabled([] {
          std::map<sidechain_type, bool> sidechain_enabled;
-         for (const auto &active_sidechain_type : active_sidechain_types) {
+         for (const auto &active_sidechain_type : all_sidechain_types) {
             sidechain_enabled.emplace(active_sidechain_type, false);
          }
          return sidechain_enabled;
       }()),
       net_handlers([] {
          std::map<sidechain_type, std::unique_ptr<sidechain_net_handler>> net_handlers;
-         for (const auto &active_sidechain_type : active_sidechain_types) {
+         for (const auto &active_sidechain_type : all_sidechain_types) {
             net_handlers.emplace(active_sidechain_type, nullptr);
          }
          return net_handlers;
@@ -149,7 +149,7 @@ peerplays_sidechain_plugin_impl::~peerplays_sidechain_plugin_impl() {
    }
 
    try {
-      for (const auto &active_sidechain_type : active_sidechain_types) {
+      for (const auto &active_sidechain_type : all_sidechain_types) {
          if (_son_processing_task.count(active_sidechain_type) != 0 && _son_processing_task.at(active_sidechain_type).valid())
             _son_processing_task.at(active_sidechain_type).wait();
       }
@@ -177,6 +177,10 @@ void peerplays_sidechain_plugin_impl::plugin_set_program_options(
    cli.add_options()("debug-rpc-calls", bpo::value<bool>()->default_value(false), "Outputs RPC calls to console");
 
    cli.add_options()("bitcoin-sidechain-enabled", bpo::value<bool>()->default_value(false), "Bitcoin sidechain handler enabled");
+   cli.add_options()("use-bitcoind-client", bpo::value<bool>()->default_value(false), "Use bitcoind client instead of libbitcoin client");
+   cli.add_options()("libbitcoin-server-ip", bpo::value<string>()->default_value("127.0.0.1"), "Libbitcoin server IP address");
+   cli.add_options()("libbitcoin-server-block-zmq-port", bpo::value<uint32_t>()->default_value(9093), "Block ZMQ port of libbitcoin server");
+   cli.add_options()("libbitcoin-server-trx-zmq-port", bpo::value<uint32_t>()->default_value(9094), "Trx ZMQ port of libbitcoin server");
    cli.add_options()("bitcoin-node-ip", bpo::value<string>()->default_value("127.0.0.1"), "IP address of Bitcoin node");
    cli.add_options()("bitcoin-node-zmq-port", bpo::value<uint32_t>()->default_value(11111), "ZMQ port of Bitcoin node");
    cli.add_options()("bitcoin-node-rpc-port", bpo::value<uint32_t>()->default_value(8332), "RPC port of Bitcoin node");
@@ -192,6 +196,8 @@ void peerplays_sidechain_plugin_impl::plugin_set_program_options(
    cli.add_options()("ethereum-node-rpc-user", bpo::value<string>(), "Ethereum RPC user");
    cli.add_options()("ethereum-node-rpc-password", bpo::value<string>(), "Ethereum RPC password");
    cli.add_options()("ethereum-wallet-contract-address", bpo::value<string>(), "Ethereum wallet contract address");
+   cli.add_options()("ethereum-erc-20-address", bpo::value<vector<string>>()->composing()->multitoken(),
+                     "Tuple of [ERC-20 symbol, ERC-20 address] (may specify multiple times)");
    cli.add_options()("ethereum-private-key", bpo::value<vector<string>>()->composing()->multitoken()->DEFAULT_VALUE_VECTOR(std::make_pair("5fbbb31be52608d2f52247e8400b7fcaa9e0bc12", "9bedac2bd8fe2a6f6528e066c67fc8ac0622e96828d40c0e820d83c5bd2b0589")),
                      "Tuple of [Ethereum public key, Ethereum private key] (may specify multiple times)");
 
@@ -247,12 +253,14 @@ void peerplays_sidechain_plugin_impl::plugin_initialize(const boost::program_opt
    }
 
    sidechain_enabled_bitcoin = options.at("bitcoin-sidechain-enabled").as<bool>();
-   config_ready_bitcoin = options.count("bitcoin-node-ip") &&
-                          options.count("bitcoin-node-zmq-port") && options.count("bitcoin-node-rpc-port") &&
-                          options.count("bitcoin-node-rpc-user") && options.count("bitcoin-node-rpc-password") &&
-                          options.count("bitcoin-wallet-name") && options.count("bitcoin-wallet-password") &&
-                          options.count("bitcoin-private-key");
-   if (sidechain_enabled_bitcoin && !config_ready_bitcoin) {
+
+   config_ready_bitcoin = (((options.count("libbitcoin-server-ip") && options.count("libbitcoin-server-zmq-port")) ||
+                            (options.count("bitcoin-node-ip") && options.count("bitcoin-node-zmq-port") &&
+                             options.count("bitcoin-node-rpc-port") && options.count("bitcoin-node-rpc-user") &&
+                             options.count("bitcoin-node-rpc-password") && options.count("bitcoin-wallet-name") &&
+                             options.count("bitcoin-wallet-password"))) &&
+                           options.count("bitcoin-private-key"));
+   if (!config_ready_bitcoin) {
       wlog("Haven't set up Bitcoin sidechain parameters");
    }
 
@@ -360,7 +368,7 @@ bool peerplays_sidechain_plugin_impl::is_active_son(sidechain_type sidechain, so
    set<son_id_type> active_son_ids;
    std::transform(gpo.active_sons.at(sidechain).cbegin(), gpo.active_sons.at(sidechain).cend(),
                   std::inserter(active_son_ids, active_son_ids.end()),
-                  [](const son_info &swi) {
+                  [](const son_sidechain_info &swi) {
                      return swi.son_id;
                   });
 
@@ -413,7 +421,7 @@ bool peerplays_sidechain_plugin_impl::is_son_down_op_valid(const chain::operatio
          status_son_down_op_valid = false;
    }
    if (status_son_down_op_valid) {
-      for (const auto &active_sidechain_type : active_sidechain_types) {
+      for (const auto &active_sidechain_type : active_sidechain_types(d.head_block_time())) {
          if (stats.last_active_timestamp.contains(active_sidechain_type)) {
             const fc::time_point_sec last_active_ts = ((stats.last_active_timestamp.at(active_sidechain_type) > last_maintenance_time) ? stats.last_active_timestamp.at(active_sidechain_type) : last_maintenance_time);
             if (((fc::time_point::now() - last_active_ts) <= fc::seconds(down_threshold))) {
@@ -466,7 +474,7 @@ void peerplays_sidechain_plugin_impl::heartbeat_loop() {
 
       //! Check that son is active (at least for one sidechain_type)
       bool is_son_active = false;
-      for (const auto &active_sidechain_type : active_sidechain_types) {
+      for (const auto &active_sidechain_type : active_sidechain_types(d.head_block_time())) {
          if (sidechain_enabled.at(active_sidechain_type)) {
             if (is_active_son(active_sidechain_type, son_id))
                is_son_active = true;
@@ -504,7 +512,7 @@ void peerplays_sidechain_plugin_impl::schedule_son_processing() {
 
    const auto next_wakeup = now + std::chrono::microseconds(time_to_next_son_processing);
 
-   for (const auto &active_sidechain_type : active_sidechain_types) {
+   for (const auto &active_sidechain_type : active_sidechain_types(plugin.database().head_block_time())) {
       if (_son_processing_task.count(active_sidechain_type) != 0 && _son_processing_task.at(active_sidechain_type).wait_for(std::chrono::seconds{0}) != std::future_status::ready) {
          wlog("Son doesn't process in time for sidechain: ${active_sidechain_type}", ("active_sidechain_type", active_sidechain_type));
          _son_processing_task.at(active_sidechain_type).wait();
@@ -621,7 +629,7 @@ bool peerplays_sidechain_plugin_impl::can_son_participate(sidechain_type sidecha
 
 std::map<sidechain_type, std::vector<std::string>> peerplays_sidechain_plugin_impl::get_son_listener_log() {
    std::map<sidechain_type, std::vector<std::string>> result;
-   for (const auto &active_sidechain_type : active_sidechain_types) {
+   for (const auto &active_sidechain_type : active_sidechain_types(plugin.database().head_block_time())) {
       if (net_handlers.at(active_sidechain_type)) {
          result.emplace(active_sidechain_type, net_handlers.at(active_sidechain_type)->get_son_listener_log());
       }
@@ -630,6 +638,11 @@ std::map<sidechain_type, std::vector<std::string>> peerplays_sidechain_plugin_im
 }
 
 optional<asset> peerplays_sidechain_plugin_impl::estimate_withdrawal_transaction_fee(sidechain_type sidechain) {
+   if (net_handlers.count(sidechain) == 0) {
+      wlog("No net handler for sidechain: ${sidechain}", ("sidechain", sidechain));
+      return optional<asset>();
+   }
+
    if (!net_handlers.at(sidechain)) {
       wlog("Net handler is null for sidechain: ${sidechain}", ("sidechain", sidechain));
       return optional<asset>();

@@ -365,7 +365,7 @@ void database::initialize_hardforks()
   _hardfork_times.emplace_back(HARDFORK_SON_FOR_HIVE_TIME);
   _hardfork_times.emplace_back(HARDFORK_SON_TIME);
   _hardfork_times.emplace_back(HARDFORK_SON2_TIME);
-  _hardfork_times.emplace_back(HARDFORK_SON3_TIME);
+  _hardfork_times.emplace_back(HARDFORK_SON_FOR_ETHEREUM_TIME);
   _hardfork_times.emplace_back(HARDFORK_SWEEPS_TIME);
 
   std::sort(_hardfork_times.begin(), _hardfork_times.end());
@@ -1167,6 +1167,11 @@ void database::init_genesis(const genesis_state_type& genesis_state)
       _sso.recent_slots_filled = fc::uint128::max_value();
    });
    assert( ssohive.id == son_schedule_id_type(get_son_schedule_id(sidechain_type::hive)) );
+
+   // Enable fees
+   modify(get_global_properties(), [&genesis_state](global_property_object& p) {
+      p.parameters.current_fees = genesis_state.initial_parameters.current_fees;
+   });
 
    // Create FBA counters
    create<fba_accumulator_object>([&]( fba_accumulator_object& acc )

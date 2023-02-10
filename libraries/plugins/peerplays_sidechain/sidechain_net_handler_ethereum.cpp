@@ -14,8 +14,9 @@
 #include <graphene/chain/account_object.hpp>
 #include <graphene/chain/protocol/son_wallet.hpp>
 #include <graphene/chain/sidechain_transaction_object.hpp>
-#include <graphene/chain/son_info.hpp>
+#include <graphene/chain/son_sidechain_info.hpp>
 #include <graphene/chain/son_wallet_object.hpp>
+#include <graphene/peerplays_sidechain/ethereum/decoders.hpp>
 #include <graphene/peerplays_sidechain/ethereum/encoders.hpp>
 #include <graphene/peerplays_sidechain/ethereum/transaction.hpp>
 #include <graphene/peerplays_sidechain/ethereum/utils.hpp>
@@ -147,6 +148,21 @@ sidechain_net_handler_ethereum::sidechain_net_handler_ethereum(peerplays_sidecha
 
    wallet_contract_address = options.at("ethereum-wallet-contract-address").as<std::string>();
 
+   if (options.count("ethereum-erc-20-address")) {
+      const std::vector<std::string> symbol_addresses = options["ethereum-erc-20-address"].as<std::vector<std::string>>();
+      for (const std::string &itr : symbol_addresses) {
+         auto itr_pair = graphene::app::dejsonify<std::pair<std::string, std::string>>(itr, 5);
+         ilog("ERC-20 symbol: ${symbol}, address: ${address}", ("symbol", itr_pair.first)("address", itr_pair.second));
+         if (!itr_pair.first.length() || !itr_pair.second.length()) {
+            FC_THROW("Invalid symbol address pair.");
+         }
+
+         auto address = itr_pair.second;
+         std::transform(address.begin(), address.end(), address.begin(), ::tolower);
+         erc20_addresses.insert(bimap_type::value_type{itr_pair.first, address});
+      }
+   }
+
    if (options.count("ethereum-private-key")) {
       const std::vector<std::string> pub_priv_keys = options["ethereum-private-key"].as<std::vector<std::string>>();
       for (const std::string &itr_key_pair : pub_priv_keys) {
@@ -218,12 +234,15 @@ bool sidechain_net_handler_ethereum::process_proposal(const proposal_object &po)
       bool address_ok = false;
       bool transaction_ok = false;
       const son_wallet_id_type swo_id = op_obj_idx_0.get<son_wallet_update_operation>().son_wallet_id;
+      const auto ast = active_sidechain_types(database.head_block_time());
+      const auto id = (swo_id.instance.value - std::distance(ast.begin(), ast.find(sidechain))) / ast.size();
+      const son_wallet_id_type op_id{id};
       const auto &idx = database.get_index_type<son_wallet_index>().indices().get<by_id>();
-      const auto swo = idx.find(swo_id);
+      const auto swo = idx.find(op_id);
       if (swo != idx.end()) {
 
          const auto active_sons = gpo.active_sons.at(sidechain);
-         const vector<son_info> wallet_sons = swo->sons.at(sidechain);
+         const vector<son_sidechain_info> wallet_sons = swo->sons.at(sidechain);
 
          bool son_sets_equal = (active_sons.size() == wallet_sons.size());
 
@@ -239,17 +258,19 @@ bool sidechain_net_handler_ethereum::process_proposal(const proposal_object &po)
 
          if (po.proposed_transaction.operations.size() >= 2) {
             const object_id_type object_id = op_obj_idx_1.get<sidechain_transaction_create_operation>().object_id;
+            const auto id = (object_id.instance() - std::distance(ast.begin(), ast.find(sidechain))) / ast.size();
+            const object_id_type obj_id{object_id.space(), object_id.type(), id};
             const std::string op_tx_str = op_obj_idx_1.get<sidechain_transaction_create_operation>().transaction;
 
             const auto &st_idx = database.get_index_type<sidechain_transaction_index>().indices().get<by_object_id>();
-            const auto st = st_idx.find(object_id);
+            const auto st = st_idx.find(obj_id);
             if (st == st_idx.end()) {
 
                std::string tx_str = "";
 
-               if (object_id.is<son_wallet_id_type>()) {
+               if (obj_id.is<son_wallet_id_type>()) {
                   const auto &idx = database.get_index_type<son_wallet_index>().indices().get<by_id>();
-                  const auto swo = idx.find(object_id);
+                  const auto swo = idx.find(obj_id);
                   if (swo != idx.end()) {
                      tx_str = create_primary_wallet_transaction(gpo.active_sons.at(sidechain), object_id.operator std::string());
                   }
@@ -290,21 +311,41 @@ bool sidechain_net_handler_ethereum::process_proposal(const proposal_object &po)
 
                const std::string sidechain_from = tx.get<std::string>("result.from");
                const std::string sidechain_to = tx.get<std::string>("result.to");
-               const std::string value_s = tx.get<std::string>("result.value");
-               boost::multiprecision::uint256_t amount(value_s);
-               amount = amount / 100000;
-               amount = amount / 100000;
-               const fc::safe<uint64_t> sidechain_amount = amount;
 
                std::string cmp_sidechain_to = sidechain_to;
                std::transform(cmp_sidechain_to.begin(), cmp_sidechain_to.end(), cmp_sidechain_to.begin(), ::toupper);
                std::string cmp_wallet_contract_address = wallet_contract_address;
                std::transform(cmp_wallet_contract_address.begin(), cmp_wallet_contract_address.end(), cmp_wallet_contract_address.begin(), ::toupper);
 
-               process_ok = (swdo_sidechain_from == sidechain_from) &&
+               //! Check whether it is ERC-20 token deposit
+               std::string symbol;
+               boost::multiprecision::uint256_t amount;
+               bool error_in_deposit = false;
+               const auto deposit_erc_20 = ethereum::deposit_erc20_decoder::decode(tx.get<std::string>("result.input"));
+               if (deposit_erc_20.valid()) {
+                  std::string cmp_token = deposit_erc_20->token;
+                  std::transform(cmp_token.begin(), cmp_token.end(), cmp_token.begin(), ::tolower);
+
+                  const auto it = erc20_addresses.right.find(cmp_token);
+                  if (it == erc20_addresses.right.end()) {
+                     wlog("No erc-20 token with address: ${address}", ("address", cmp_token));
+                     error_in_deposit = true;
+                  }
+                  symbol = it->second;
+                  amount = deposit_erc_20->amount;
+               } else {
+                  symbol = "ETH";
+                  const std::string value_s = tx.get<std::string>("result.value");
+                  amount = boost::multiprecision::uint256_t{value_s};
+                  amount = amount / 100000;
+                  amount = amount / 100000;
+               }
+
+               process_ok = (!error_in_deposit) &&
+                            (swdo_sidechain_from == sidechain_from) &&
                             (cmp_sidechain_to == cmp_wallet_contract_address) &&
-                            (swdo_sidechain_currency == "ETH") &&
-                            (swdo_sidechain_amount == sidechain_amount.value);
+                            (swdo_sidechain_currency == symbol) &&
+                            (swdo_sidechain_amount == fc::safe<uint64_t>{amount}.value);
             }
          }
       }
@@ -416,29 +457,33 @@ void sidechain_net_handler_ethereum::process_primary_wallet() {
       if ((active_sw->addresses.find(sidechain) == active_sw->addresses.end()) ||
           (active_sw->addresses.at(sidechain).empty())) {
 
-         if (proposal_exists(chain::operation::tag<chain::son_wallet_update_operation>::value, active_sw->id)) {
+         const auto ast = active_sidechain_types(database.head_block_time());
+         const auto id = active_sw->id.instance() * ast.size() + std::distance(ast.begin(), ast.find(sidechain));
+         const object_id_type op_id{active_sw->id.space(), active_sw->id.type(), id};
+
+         if (proposal_exists(chain::operation::tag<chain::son_wallet_update_operation>::value, op_id)) {
             return;
          }
 
-         if (!plugin.can_son_participate(sidechain, chain::operation::tag<chain::son_wallet_update_operation>::value, active_sw->id)) {
+         if (!plugin.can_son_participate(sidechain, chain::operation::tag<chain::son_wallet_update_operation>::value, op_id)) {
             return;
          }
 
          const chain::global_property_object &gpo = database.get_global_properties();
          proposal_create_operation proposal_op;
          proposal_op.fee_paying_account = plugin.get_current_son_object(sidechain).son_account;
-         uint32_t lifetime = (gpo.parameters.block_interval * gpo.active_witnesses.size()) * 3;
+         const uint32_t lifetime = (gpo.parameters.block_interval * gpo.active_witnesses.size()) * 3;
          proposal_op.expiration_time = time_point_sec(database.head_block_time().sec_since_epoch() + lifetime);
 
          son_wallet_update_operation swu_op;
          swu_op.payer = gpo.parameters.son_account();
-         swu_op.son_wallet_id = active_sw->id;
+         swu_op.son_wallet_id = op_id;
          swu_op.sidechain = sidechain;
          swu_op.address = wallet_contract_address;
          proposal_op.proposed_ops.emplace_back(swu_op);
 
          const auto signers = [this, &prev_sw, &active_sw, &swi] {
-            std::vector<son_info> signers;
+            std::vector<son_sidechain_info> signers;
             //! Check if we don't have any previous set of active SONs use the current one
             if (prev_sw != swi.rend()) {
                if (!prev_sw->sons.at(sidechain).empty())
@@ -452,14 +497,21 @@ void sidechain_net_handler_ethereum::process_primary_wallet() {
             return signers;
          }();
 
-         std::string tx_str = create_primary_wallet_transaction(gpo.active_sons.at(sidechain), active_sw->id.operator std::string());
+         std::string tx_str = create_primary_wallet_transaction(gpo.active_sons.at(sidechain), op_id.operator std::string());
          if (!tx_str.empty()) {
             sidechain_transaction_create_operation stc_op;
             stc_op.payer = gpo.parameters.son_account();
-            stc_op.object_id = active_sw->id;
+            stc_op.object_id = op_id;
             stc_op.sidechain = sidechain;
             stc_op.transaction = tx_str;
-            stc_op.signers = signers;
+            for (const auto &signer : signers) {
+               son_info si;
+               si.son_id = signer.son_id;
+               si.weight = signer.weight;
+               si.signing_key = signer.signing_key;
+               si.sidechain_public_keys[sidechain] = signer.public_key;
+               stc_op.signers.emplace_back(std::move(si));
+            }
             proposal_op.proposed_ops.emplace_back(stc_op);
          }
 
@@ -469,7 +521,7 @@ void sidechain_net_handler_ethereum::process_primary_wallet() {
             database.push_transaction(trx, database::validation_steps::skip_block_size_check);
             if (plugin.app().p2p_node())
                plugin.app().p2p_node()->broadcast(net::trx_message(trx));
-            plugin.log_son_proposal_retry(sidechain, chain::operation::tag<chain::son_wallet_update_operation>::value, active_sw->id);
+            plugin.log_son_proposal_retry(sidechain, chain::operation::tag<chain::son_wallet_update_operation>::value, op_id);
          } catch (fc::exception &e) {
             elog("Sending proposal for son wallet update operation failed with exception ${e}", ("e", e.what()));
             return;
@@ -489,12 +541,19 @@ bool sidechain_net_handler_ethereum::process_deposit(const son_wallet_deposit_ob
 
    const chain::global_property_object &gpo = database.get_global_properties();
 
-   price asset_price = database.get<asset_object>(database.get_global_properties().parameters.eth_asset()).options.core_exchange_rate;
-   asset asset_to_issue = asset(swdo.peerplays_asset.amount * asset_price.quote.amount / asset_price.base.amount, database.get_global_properties().parameters.eth_asset());
+   const auto &assets_by_symbol = database.get_index_type<asset_index>().indices().get<by_symbol>();
+   const auto asset_itr = assets_by_symbol.find(swdo.sidechain_currency);
+   if (asset_itr == assets_by_symbol.end()) {
+      wlog("Could not find asset: ${symbol}", ("symbol", swdo.sidechain_currency));
+      return false;
+   }
+
+   const price asset_price = asset_itr->options.core_exchange_rate;
+   const asset asset_to_issue = asset(swdo.peerplays_asset.amount * asset_price.quote.amount / asset_price.base.amount, asset_itr->get_id());
 
    proposal_create_operation proposal_op;
    proposal_op.fee_paying_account = plugin.get_current_son_object(sidechain).son_account;
-   uint32_t lifetime = (gpo.parameters.block_interval * gpo.active_witnesses.size()) * 3;
+   const uint32_t lifetime = (gpo.parameters.block_interval * gpo.active_witnesses.size()) * 3;
    proposal_op.expiration_time = time_point_sec(database.head_block_time().sec_since_epoch() + lifetime);
 
    son_wallet_deposit_process_operation swdp_op;
@@ -537,7 +596,7 @@ bool sidechain_net_handler_ethereum::process_withdrawal(const son_wallet_withdra
 
       proposal_create_operation proposal_op;
       proposal_op.fee_paying_account = plugin.get_current_son_object(sidechain).son_account;
-      uint32_t lifetime = (gpo.parameters.block_interval * gpo.active_witnesses.size()) * 3;
+      const uint32_t lifetime = (gpo.parameters.block_interval * gpo.active_witnesses.size()) * 3;
       proposal_op.expiration_time = time_point_sec(database.head_block_time().sec_since_epoch() + lifetime);
 
       son_wallet_withdraw_process_operation swwp_op;
@@ -550,7 +609,14 @@ bool sidechain_net_handler_ethereum::process_withdrawal(const son_wallet_withdra
       stc_op.object_id = swwo.id;
       stc_op.sidechain = sidechain;
       stc_op.transaction = tx_str;
-      stc_op.signers = gpo.active_sons.at(sidechain);
+      for (const auto &signer : gpo.active_sons.at(sidechain)) {
+         son_info si;
+         si.son_id = signer.son_id;
+         si.weight = signer.weight;
+         si.signing_key = signer.signing_key;
+         si.sidechain_public_keys[sidechain] = signer.public_key;
+         stc_op.signers.emplace_back(std::move(si));
+      }
       proposal_op.proposed_ops.emplace_back(stc_op);
 
       signed_transaction trx = database.create_signed_transaction(plugin.get_private_key(plugin.get_current_son_id(sidechain)), proposal_op);
@@ -683,7 +749,13 @@ bool sidechain_net_handler_ethereum::settle_sidechain_transaction(const sidechai
 
       if (sto.object_id.is<son_wallet_withdraw_id_type>()) {
          auto swwo = database.get<son_wallet_withdraw_object>(sto.object_id);
-         settle_amount = asset(swwo.withdraw_amount, database.get_global_properties().parameters.eth_asset());
+         const auto &assets_by_symbol = database.get_index_type<asset_index>().indices().get<by_symbol>();
+         const auto asset_itr = assets_by_symbol.find(swwo.withdraw_currency);
+         if (asset_itr == assets_by_symbol.end()) {
+            wlog("Could not find asset: ${symbol}", ("symbol", swwo.withdraw_currency));
+            return false;
+         }
+         settle_amount = asset(swwo.withdraw_amount, asset_itr->get_id());
       }
 
       return true;
@@ -712,24 +784,19 @@ optional<asset> sidechain_net_handler_ethereum::estimate_withdrawal_transaction_
       return optional<asset>{};
    }
 
-   const auto &assets_by_symbol = database.get_index_type<asset_index>().indices().get<by_symbol>();
-   auto asset_itr = assets_by_symbol.find("ETH");
-   if (asset_itr == assets_by_symbol.end()) {
-      wlog("Could not find asset matching ETH");
-      return optional<asset>{};
-   }
-
    const auto &public_key = son->sidechain_public_keys.at(sidechain);
-   const auto data = ethereum::withdrawal_encoder::encode(public_key, 1 * 10000000000, son_wallet_withdraw_id_type{0}.operator object_id_type().operator std::string());
+   const auto data = ethereum::withdrawal_encoder::encode(public_key, boost::multiprecision::uint256_t{1} * boost::multiprecision::uint256_t{10000000000}, son_wallet_withdraw_id_type{0}.operator object_id_type().operator std::string());
    const std::string params = "[{\"from\":\"" + ethereum::add_0x(public_key) + "\", \"to\":\"" + wallet_contract_address + "\", \"data\":\"" + data + "\"}]";
 
    const auto estimate_gas = ethereum::from_hex<int64_t>(rpc_client->get_estimate_gas(params));
    const auto gas_price = ethereum::from_hex<int64_t>(rpc_client->get_gas_price());
    const auto eth_gas_fee = double(estimate_gas * gas_price) / double{1000000000000000000};
-   return asset_itr->amount_from_string(std::to_string(eth_gas_fee));
+
+   const auto asset = database.get<asset_object>(database.get_global_properties().parameters.eth_asset());
+   return asset.amount_from_string(std::to_string(eth_gas_fee));
 }
 
-std::string sidechain_net_handler_ethereum::create_primary_wallet_transaction(const std::vector<son_info> &son_pubkeys, const std::string &object_id) {
+std::string sidechain_net_handler_ethereum::create_primary_wallet_transaction(const std::vector<son_sidechain_info> &son_pubkeys, const std::string &object_id) {
    std::vector<std::pair<std::string, uint16_t>> owners_weights;
    for (auto &son : son_pubkeys) {
       const std::string pub_key_str = son.public_key;
@@ -739,12 +806,19 @@ std::string sidechain_net_handler_ethereum::create_primary_wallet_transaction(co
    return ethereum::update_owners_encoder::encode(owners_weights, object_id);
 }
 
-std::string sidechain_net_handler_ethereum::create_deposit_transaction(const son_wallet_deposit_object &swdo) {
-   return "Deposit-Transaction";
-}
-
 std::string sidechain_net_handler_ethereum::create_withdrawal_transaction(const son_wallet_withdraw_object &swwo) {
-   return ethereum::withdrawal_encoder::encode(swwo.withdraw_address.substr(2), swwo.withdraw_amount.value * 10000000000, swwo.id.operator std::string());
+   if (swwo.withdraw_currency == "ETH") {
+      return ethereum::withdrawal_encoder::encode(ethereum::remove_0x(swwo.withdraw_address), boost::multiprecision::uint256_t{swwo.withdraw_amount.value} * boost::multiprecision::uint256_t{10000000000}, swwo.id.operator std::string());
+   } else {
+      const auto it = erc20_addresses.left.find(swwo.withdraw_currency);
+      if (it == erc20_addresses.left.end()) {
+         elog("No erc-20 token: ${symbol}", ("symbol", swwo.withdraw_currency));
+         return "";
+      }
+      return ethereum::withdrawal_erc20_encoder::encode(ethereum::remove_0x(it->second), ethereum::remove_0x(swwo.withdraw_address), boost::multiprecision::uint256_t{swwo.withdraw_amount.value}, swwo.id.operator std::string());
+   }
+
+   return "";
 }
 
 std::string sidechain_net_handler_ethereum::sign_transaction(const sidechain_transaction_object &sto) {
@@ -761,10 +835,10 @@ std::string sidechain_net_handler_ethereum::sign_transaction(const sidechain_tra
 }
 
 void sidechain_net_handler_ethereum::schedule_ethereum_listener() {
-   fc::time_point now = fc::time_point::now();
-   int64_t time_to_next = 5000;
+   const fc::time_point now = fc::time_point::now();
+   const int64_t time_to_next = 5000;
 
-   fc::time_point next_wakeup(now + fc::milliseconds(time_to_next));
+   const fc::time_point next_wakeup(now + fc::milliseconds(time_to_next));
 
    _listener_task = fc::schedule([this] {
       ethereum_listener_loop();
@@ -776,10 +850,9 @@ void sidechain_net_handler_ethereum::ethereum_listener_loop() {
    schedule_ethereum_listener();
 
    const auto reply = rpc_client->eth_blockNumber();
-   //std::string reply = rpc_client->eth_get_logs(wallet_contract_address);
 
    if (!reply.empty()) {
-      uint64_t head_block_number = ethereum::from_hex<uint64_t>(reply);
+      const uint64_t head_block_number = ethereum::from_hex<uint64_t>(reply);
 
       if (head_block_number != last_block_received) {
          //! Check that current block number is greater than last one
@@ -814,11 +887,11 @@ void sidechain_net_handler_ethereum::handle_event(const std::string &block_numbe
 
       size_t tx_idx = -1;
       for (const auto &tx_child : block_json.get_child("result.transactions")) {
-         boost::property_tree::ptree tx = tx_child.second;
+         const boost::property_tree::ptree tx = tx_child.second;
          tx_idx = tx_idx + 1;
 
-         std::string from = tx.get<std::string>("from");
-         std::string to = tx.get<std::string>("to");
+         const std::string from = tx.get<std::string>("from");
+         const std::string to = tx.get<std::string>("to");
 
          std::string cmp_to = to;
          std::transform(cmp_to.begin(), cmp_to.end(), cmp_to.begin(), ::toupper);
@@ -827,10 +900,35 @@ void sidechain_net_handler_ethereum::handle_event(const std::string &block_numbe
 
          if (cmp_to == cmp_wallet_contract_address) {
 
-            std::string value_s = tx.get<std::string>("value");
-            boost::multiprecision::uint256_t amount(value_s);
-            amount = amount / 100000;
-            amount = amount / 100000;
+            //! Check whether it is ERC-20 token deposit
+            std::string symbol;
+            boost::multiprecision::uint256_t amount;
+            const auto deposit_erc_20 = ethereum::deposit_erc20_decoder::decode(tx.get<std::string>("input"));
+            if (deposit_erc_20.valid()) {
+               std::string cmp_token = deposit_erc_20->token;
+               std::transform(cmp_token.begin(), cmp_token.end(), cmp_token.begin(), ::tolower);
+
+               const auto it = erc20_addresses.right.find(cmp_token);
+               if (it == erc20_addresses.right.end()) {
+                  wlog("No erc-20 token with address: ${address}", ("address", cmp_token));
+                  continue;
+               }
+               symbol = it->second;
+               amount = deposit_erc_20->amount;
+            } else {
+               symbol = "ETH";
+               const std::string value_s = tx.get<std::string>("value");
+               amount = boost::multiprecision::uint256_t{value_s};
+               amount = amount / 100000;
+               amount = amount / 100000;
+            }
+
+            const auto &assets_by_symbol = database.get_index_type<asset_index>().indices().get<by_symbol>();
+            const auto asset_itr = assets_by_symbol.find(symbol);
+            if (asset_itr == assets_by_symbol.end()) {
+               wlog("Could not find asset: ${symbol}", ("symbol", symbol));
+               continue;
+            }
 
             const auto &sidechain_addresses_idx = database.get_index_type<sidechain_address_index>().indices().get<by_sidechain_and_deposit_address_and_expires>();
             const auto &addr_itr = sidechain_addresses_idx.find(std::make_tuple(sidechain, from, time_point_sec::maximum()));
@@ -841,22 +939,22 @@ void sidechain_net_handler_ethereum::handle_event(const std::string &block_numbe
             std::stringstream ss;
             ss << "ethereum"
                << "-" << tx.get<std::string>("hash") << "-" << tx_idx;
-            std::string sidechain_uid = ss.str();
 
             sidechain_event_data sed;
             sed.timestamp = database.head_block_time();
             sed.block_num = database.head_block_num();
             sed.sidechain = sidechain;
-            sed.sidechain_uid = sidechain_uid;
+            sed.type = sidechain_event_type::deposit;
+            sed.sidechain_uid = ss.str();
             sed.sidechain_transaction_id = tx.get<std::string>("hash");
             sed.sidechain_from = from;
             sed.sidechain_to = to;
-            sed.sidechain_currency = "ETH";
+            sed.sidechain_currency = symbol;
             sed.sidechain_amount = amount;
             sed.peerplays_from = addr_itr->sidechain_address_account;
             sed.peerplays_to = database.get_global_properties().parameters.son_account();
-            price eth_price = database.get<asset_object>(database.get_global_properties().parameters.eth_asset()).options.core_exchange_rate;
-            sed.peerplays_asset = asset(sed.sidechain_amount * eth_price.base.amount / eth_price.quote.amount);
+            const price price = asset_itr->options.core_exchange_rate;
+            sed.peerplays_asset = asset(sed.sidechain_amount * price.base.amount / price.quote.amount);
 
             add_to_son_listener_log("TRX     : " + sed.sidechain_transaction_id);
 
