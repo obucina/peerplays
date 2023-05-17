@@ -29,6 +29,8 @@ build-mainnet:
       - build/libraries/
       - build/programs/
       - build/tests/
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "beatrice" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "beatrice" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master"
   tags:
     - builder
 
@@ -80,8 +82,8 @@ build-testnet:
       - build/programs/
       - build/tests/
   rules:
-    - if: $CI_COMMIT_BRANCH == "master"
-      when: always
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "beatrice" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "beatrice" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master"
+      when: manual
   tags:
     - builder
 
