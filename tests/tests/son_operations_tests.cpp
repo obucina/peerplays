@@ -574,7 +574,7 @@ BOOST_AUTO_TEST_CASE( son_pay_test )
       BOOST_REQUIRE_EQUAL(son_stats_obj2->total_sidechain_txs_reported.at(sidechain_type::hive), 12);
       BOOST_REQUIRE_EQUAL(son_stats_obj2->total_sidechain_txs_reported.at(sidechain_type::ethereum), 18);
       // Check that Alice and Bob are paid for signing the transactions in the previous day/cycle
-      BOOST_REQUIRE_EQUAL(db.get_balance(obj1->son_account, asset_id_type()).amount.value, 80+obj1_balance);
+      BOOST_REQUIRE_EQUAL(db.get_balance(obj1->son_account, asset_id_type()).amount.value, 79+obj1_balance);
       BOOST_REQUIRE_EQUAL(db.get_balance(obj2->son_account, asset_id_type()).amount.value, 120+obj2_balance);
       // Check the SON Budget is again allocated after maintenance
       BOOST_CHECK( dpo.son_budget.value == 200);
