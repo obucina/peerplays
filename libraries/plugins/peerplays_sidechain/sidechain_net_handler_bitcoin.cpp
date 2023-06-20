@@ -674,7 +674,7 @@ sidechain_net_handler_bitcoin::sidechain_net_handler_bitcoin(peerplays_sidechain
    uint32_t rpc_port = options.at("bitcoin-node-rpc-port").as<uint32_t>();
    std::string rpc_user = options.at("bitcoin-node-rpc-user").as<std::string>();
    std::string rpc_password = options.at("bitcoin-node-rpc-password").as<std::string>();
-   
+
    if (options.count("use-bitcoind-client")) {
       use_bitcoind_client = options.at("use-bitcoind-client").as<bool>();
    }

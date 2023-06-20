@@ -185,13 +185,109 @@ void database::update_worker_votes()
    }
 }
 
-void database::pay_sons()
+void database::pay_sons_before_hf_ethereum()
+{
+   const auto now = head_block_time();
+   const dynamic_global_property_object& dpo = get_dynamic_global_properties();
+   // Current requirement is that we have to pay every 24 hours, so the following check
+   if( dpo.son_budget.value > 0 && ((now - dpo.last_son_payout_time) >= fc::seconds(get_global_properties().parameters.son_pay_time())))
+   {
+      const sidechain_type st = sidechain_type::bitcoin;
+      const auto sons = sort_votable_objects<son_index>(st, get_global_properties().parameters.maximum_son_count());
+
+      // After SON2 HF
+      uint64_t total_votes = 0;
+      for( const son_object& son : sons )
+      {
+         FC_ASSERT(son.get_sidechain_vote_id(st).valid(), "Invalid vote id, sidechain: ${sidechain}, son: ${son}", ("sidechain", st)("son", son));
+         total_votes += _vote_tally_buffer[*son.get_sidechain_vote_id(st)];
+      }
+      const int8_t bits_to_drop = std::max(int(boost::multiprecision::detail::find_msb(total_votes)) - 15, 0);
+      auto get_weight = [&bits_to_drop]( uint64_t son_votes ) {
+         const uint16_t weight = std::max((son_votes >> bits_to_drop), uint64_t(1) );
+         return weight;
+      };
+
+      // Before SON2 HF
+      auto get_weight_before_son2_hf = []( uint64_t son_votes ) {
+         const int8_t bits_to_drop = std::max(int(boost::multiprecision::detail::find_msb(son_votes)) - 15, 0);
+         const uint16_t weight = std::max((son_votes >> bits_to_drop), uint64_t(1) );
+         return weight;
+      };
+
+      uint64_t weighted_total_txs_signed = 0;
+      const share_type son_budget = dpo.son_budget;
+      get_index_type<son_stats_index>().inspect_all_objects([this, &weighted_total_txs_signed, &get_weight, &now, &get_weight_before_son2_hf, &st](const object& o) {
+         const son_statistics_object& s = static_cast<const son_statistics_object&>(o);
+         const auto& idx = get_index_type<son_index>().indices().get<by_id>();
+         const auto son_obj = idx.find( s.owner );
+         uint16_t son_weight = 0;
+         FC_ASSERT(son_obj->get_sidechain_vote_id(st).valid(), "Invalid vote id, sidechain: ${sidechain}, son: ${son}", ("sidechain", st)("son", *son_obj));
+         if( now >= HARDFORK_SON2_TIME ) {
+            son_weight += get_weight(_vote_tally_buffer[*son_obj->get_sidechain_vote_id(st)]);
+         }
+         else {
+            son_weight += get_weight_before_son2_hf(_vote_tally_buffer[*son_obj->get_sidechain_vote_id(st)]);
+         }
+         const uint64_t txs_signed_bitcoin = s.txs_signed.contains(sidechain_type::bitcoin) ? s.txs_signed.at(sidechain_type::bitcoin) : 0;
+         const uint64_t txs_signed_hive = s.txs_signed.contains(sidechain_type::hive) ? s.txs_signed.at(sidechain_type::hive) : 0;
+         weighted_total_txs_signed += ((txs_signed_bitcoin + txs_signed_hive) * son_weight);
+      });
+
+      // Now pay off each SON proportional to the number of transactions signed.
+      get_index_type<son_stats_index>().inspect_all_objects([this, &weighted_total_txs_signed, &dpo, &son_budget, &get_weight, &get_weight_before_son2_hf, &now, &st](const object& o) {
+         const son_statistics_object& s = static_cast<const son_statistics_object&>(o);
+         const uint64_t txs_signed_bitcoin = s.txs_signed.contains(sidechain_type::bitcoin) ? s.txs_signed.at(sidechain_type::bitcoin) : 0;
+         const uint64_t txs_signed_hive = s.txs_signed.contains(sidechain_type::hive) ? s.txs_signed.at(sidechain_type::hive) : 0;
+
+         if(txs_signed_bitcoin > 0 || txs_signed_hive > 0) {
+            const auto& idx = get_index_type<son_index>().indices().get<by_id>();
+            auto son_obj = idx.find( s.owner );
+            uint16_t son_weight = 0;
+            FC_ASSERT(son_obj->get_sidechain_vote_id(st).valid(), "Invalid vote id, sidechain: ${sidechain}, son: ${son}", ("sidechain", st)("son", *son_obj));
+            if( now >= HARDFORK_SON2_TIME ) {
+               son_weight += get_weight(_vote_tally_buffer[*son_obj->get_sidechain_vote_id(st)]);
+            }
+            else {
+               son_weight += get_weight_before_son2_hf(_vote_tally_buffer[*son_obj->get_sidechain_vote_id(st)]);
+            }
+            const share_type pay = ((txs_signed_bitcoin + txs_signed_hive) * son_weight * son_budget.value)/weighted_total_txs_signed;
+            modify( *son_obj, [&]( son_object& _son_obj)
+            {
+               _son_obj.pay_son_fee(pay, *this);
+            });
+            //Remove the amount paid out to SON from global SON Budget
+            modify( dpo, [&]( dynamic_global_property_object& _dpo )
+            {
+               _dpo.son_budget -= pay;
+            } );
+            //Reset the tx counter in each son statistics object
+            modify( s, [&]( son_statistics_object& _s)
+            {
+               if(_s.txs_signed.contains(sidechain_type::bitcoin))
+                  _s.txs_signed.at(sidechain_type::bitcoin) = 0;
+               if(_s.txs_signed.contains(sidechain_type::hive))
+                  _s.txs_signed.at(sidechain_type::hive) = 0;
+            });
+         }
+      });
+
+      //Note the last son pay out time
+      modify( dpo, [&]( dynamic_global_property_object& _dpo )
+      {
+         _dpo.last_son_payout_time = now;
+      });
+   }
+}
+
+void database::pay_sons_after_hf_ethereum()
 {
    const time_point_sec now = head_block_time();
    const dynamic_global_property_object& dpo = get_dynamic_global_properties();
    // Current requirement is that we have to pay every 24 hours, so the following check
    if( dpo.son_budget.value > 0 && ((now - dpo.last_son_payout_time) >= fc::seconds(get_global_properties().parameters.son_pay_time())))
    {
+      flat_map<sidechain_type, int8_t> bits_to_drop;
       for(const auto& active_sidechain_type : active_sidechain_types(now))
       {
          assert( _son_count_histogram_buffer.at(active_sidechain_type).size() > 0 );
@@ -209,93 +305,72 @@ void database::pay_sons()
             }
          }
 
-         const sidechain_type st = [&now, &active_sidechain_type]{
-            if( now < HARDFORK_SON_FOR_ETHEREUM_TIME )
-               return sidechain_type::bitcoin;
-            else
-               return active_sidechain_type;
-         }();
-
-         const auto sons = sort_votable_objects<son_index>(st,
-            (std::max(son_count*2+1, (size_t)get_chain_properties().immutable_parameters.min_son_count))
-         );
+         const auto sons = sort_votable_objects<son_index>(active_sidechain_type, (std::max(son_count*2+1, (size_t)get_chain_properties().immutable_parameters.min_son_count)));
 
          // After SON2 HF
          uint64_t total_votes = 0;
          for( const son_object& son : sons )
          {
-            FC_ASSERT(son.get_sidechain_vote_id(st).valid(), "Invalid vote id, sidechain: ${sidechain}, son: ${son}", ("sidechain", st)("son", son));
-            total_votes += _vote_tally_buffer[*son.get_sidechain_vote_id(st)];
+            FC_ASSERT(son.get_sidechain_vote_id(active_sidechain_type).valid(), "Invalid vote id, sidechain: ${sidechain}, son: ${son}", ("sidechain", active_sidechain_type)("son", son));
+            total_votes += _vote_tally_buffer[*son.get_sidechain_vote_id(active_sidechain_type)];
          }
-         const int8_t bits_to_drop = std::max(int(boost::multiprecision::detail::find_msb(total_votes)) - 15, 0);
-         auto get_weight = [&bits_to_drop]( uint64_t son_votes ) {
-            const uint16_t weight = std::max((son_votes >> bits_to_drop), uint64_t(1) );
-            return weight;
-         };
-         // Before SON2 HF
-         auto get_weight_before_son2_hf = []( uint64_t son_votes ) {
-            const int8_t bits_to_drop = std::max(int(boost::multiprecision::detail::find_msb(son_votes)) - 15, 0);
-            const uint16_t weight = std::max((son_votes >> bits_to_drop), uint64_t(1) );
-            return weight;
-         };
-         uint64_t weighted_total_txs_signed = 0;
-         const share_type son_budget = dpo.son_budget;
-         get_index_type<son_stats_index>().inspect_all_objects([this, &weighted_total_txs_signed, &get_weight, &now, &get_weight_before_son2_hf, &active_sidechain_type, &st](const object& o) {
-            const son_statistics_object& s = static_cast<const son_statistics_object&>(o);
-            const auto& idx = get_index_type<son_index>().indices().get<by_id>();
-            const auto son_obj = idx.find( s.owner );
-            uint16_t son_weight = 0;
-            FC_ASSERT(son_obj->get_sidechain_vote_id(st).valid(), "Invalid vote id, sidechain: ${sidechain}, son: ${son}", ("sidechain", st)("son", *son_obj));
-            if( now >= HARDFORK_SON2_TIME ) {
-               son_weight += get_weight(_vote_tally_buffer[*son_obj->get_sidechain_vote_id(st)]);
-            }
-            else {
-               son_weight += get_weight_before_son2_hf(_vote_tally_buffer[*son_obj->get_sidechain_vote_id(st)]);
-            }
+         bits_to_drop[active_sidechain_type] = std::max(int(boost::multiprecision::detail::find_msb(total_votes)) - 15, 0);
+      }
+
+      auto get_weight = [&bits_to_drop]( sidechain_type sidechain, uint64_t son_votes ) {
+         const uint16_t weight = std::max((son_votes >> bits_to_drop.at(sidechain)), uint64_t(1) );
+         return weight;
+      };
+
+      // Calculate weighted_total_txs_signed
+      uint64_t weighted_total_txs_signed = 0;
+      get_index_type<son_stats_index>().inspect_all_objects([this, &weighted_total_txs_signed, &get_weight, &now](const object& o) {
+         for(const auto& active_sidechain_type : active_sidechain_types(now)) {
+            const son_statistics_object &s = static_cast<const son_statistics_object &>(o);
+            const auto &idx = get_index_type<son_index>().indices().get<by_id>();
+            const auto son_obj = idx.find(s.owner);
+            FC_ASSERT(son_obj->get_sidechain_vote_id(active_sidechain_type).valid(), "Invalid vote id, sidechain: ${sidechain}, son: ${son}", ("sidechain", active_sidechain_type)("son", *son_obj));
+            const uint16_t son_weight = get_weight(active_sidechain_type, _vote_tally_buffer[*son_obj->get_sidechain_vote_id(active_sidechain_type)]);
             const uint64_t txs_signed = s.txs_signed.contains(active_sidechain_type) ? s.txs_signed.at(active_sidechain_type) : 0;
             weighted_total_txs_signed += (txs_signed * son_weight);
-         });
+         }
+      });
 
-         // Now pay off each SON proportional to the number of transactions signed.
-         get_index_type<son_stats_index>().inspect_all_objects([this, &weighted_total_txs_signed, &dpo, &son_budget, &get_weight, &get_weight_before_son2_hf, &now, &active_sidechain_type, &st](const object& o) {
-            const son_statistics_object& s = static_cast<const son_statistics_object&>(o);
+      // Now pay off each SON proportional to the number of transactions signed
+      const share_type son_budget = dpo.son_budget;
+      get_index_type<son_stats_index>().inspect_all_objects([this, &now, &get_weight, &weighted_total_txs_signed, &dpo, &son_budget](const object& o) {
+         for(const auto& active_sidechain_type : active_sidechain_types(now)) {
+            const son_statistics_object &s = static_cast<const son_statistics_object &>(o);
+
             const uint64_t txs_signed = s.txs_signed.contains(active_sidechain_type) ? s.txs_signed.at(active_sidechain_type) : 0;
-
-            if(txs_signed > 0) {
-               const auto& idx = get_index_type<son_index>().indices().get<by_id>();
-               auto son_obj = idx.find( s.owner );
+            if (txs_signed > 0) {
+               const auto &idx = get_index_type<son_index>().indices().get<by_id>();
+               auto son_obj = idx.find(s.owner);
                uint16_t son_weight = 0;
-               FC_ASSERT(son_obj->get_sidechain_vote_id(st).valid(), "Invalid vote id, sidechain: ${sidechain}, son: ${son}", ("sidechain", st)("son", *son_obj));
-               if( now >= HARDFORK_SON2_TIME ) {
-                  son_weight += get_weight(_vote_tally_buffer[*son_obj->get_sidechain_vote_id(st)]);
-               }
-               else {
-                  son_weight += get_weight_before_son2_hf(_vote_tally_buffer[*son_obj->get_sidechain_vote_id(st)]);
-               }
-               const share_type pay = (txs_signed * son_weight * son_budget.value)/weighted_total_txs_signed;
-               modify( *son_obj, [&]( son_object& _son_obj)
-               {
-                _son_obj.pay_son_fee(pay, *this);
+               FC_ASSERT(son_obj->get_sidechain_vote_id(active_sidechain_type).valid(), "Invalid vote id, sidechain: ${sidechain}, son: ${son}", ("sidechain", active_sidechain_type)("son", *son_obj));
+               son_weight += get_weight(active_sidechain_type, _vote_tally_buffer[*son_obj->get_sidechain_vote_id(active_sidechain_type)]);
+               const share_type pay = (txs_signed * son_weight * son_budget.value) / weighted_total_txs_signed;
+               modify(*son_obj, [&](son_object &_son_obj) {
+                  _son_obj.pay_son_fee(pay, *this);
                });
-               //Remove the amount paid out to SON from global SON Budget
-               modify( dpo, [&]( dynamic_global_property_object& _dpo )
-               {
-                _dpo.son_budget -= pay;
-               } );
-               //Reset the tx counter in each son statistics object
-               modify( s, [&]( son_statistics_object& _s)
-               {
-                  if(_s.txs_signed.contains(active_sidechain_type))
+               // Remove the amount paid out to SON from global SON Budget
+               modify(dpo, [&](dynamic_global_property_object &_dpo) {
+                  _dpo.son_budget -= pay;
+               });
+               // Reset the tx counter in each son statistics object
+               modify(s, [&](son_statistics_object &_s) {
+                  if (_s.txs_signed.contains(active_sidechain_type))
                      _s.txs_signed.at(active_sidechain_type) = 0;
                });
             }
-         });
-         //Note the last son pay out time
-         modify( dpo, [&]( dynamic_global_property_object& _dpo )
-         {
-          _dpo.last_son_payout_time = now;
-         });
-      }
+         }
+      });
+
+      //Note the last son pay out time
+      modify( dpo, [&]( dynamic_global_property_object& _dpo )
+      {
+         _dpo.last_son_payout_time = now;
+      });
    }
 }
 
@@ -2152,7 +2227,7 @@ void database::perform_son_tasks()
       });
    }
    // create HIVE asset here because son_account is the issuer of the HIVE
-   if (gpo.parameters.hive_asset() == asset_id_type()  && head_block_time() >= HARDFORK_SON_FOR_HIVE_TIME)
+   if (gpo.parameters.hive_asset() == asset_id_type() && head_block_time() >= HARDFORK_SON_FOR_HIVE_TIME)
    {
       const asset_dynamic_data_object& dyn_asset =
          create<asset_dynamic_data_object>([](asset_dynamic_data_object& a) {
@@ -2192,7 +2267,10 @@ void database::perform_son_tasks()
       // Before making a budget we should pay out SONs
       // This function should check if its time to pay sons
       // and modify the global son funds accordingly, whatever is left is passed on to next budget
-      pay_sons();
+      if(head_block_time() < HARDFORK_SON_FOR_ETHEREUM_TIME)
+         pay_sons_before_hf_ethereum();
+      else
+         pay_sons_after_hf_ethereum();
    }
 
    // Split vote_ids
