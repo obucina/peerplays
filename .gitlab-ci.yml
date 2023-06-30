@@ -151,16 +151,19 @@ test-e2e:
     - python3 -m venv venv
     - source venv/bin/activate
     - pip3 install -r requirements.txt
-    - python3 main.py --stop
+    - docker-compose down --remove-orphans
     - docker ps -a
     - docker pull $IMAGE
     - docker tag $IMAGE peerplays-base:latest
     - docker image ls -a
+    - docker-compose build
     - python3 main.py --start all
     - docker ps -a
     - python3 -m pytest test_btc_init_state.py test_hive_inital_state.py test_pp_inital_state.py
     - python3 main.py --stop
     - deactivate
     - docker ps -a
+  after_script:
+    - docker rmi $(docker images -a | grep -v 'hive-for-peerplays\|ethereum-for-peerplays\|bitcoin-for-peerplays\|ubuntu-for-peerplays' | awk '{print $3}')
   tags:
     - python-tests
