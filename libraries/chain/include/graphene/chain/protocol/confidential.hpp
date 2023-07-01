@@ -158,9 +158,7 @@ struct transfer_to_blind_operation : public base_operation
    blind_factor_type     blinding_factor;
    vector<blind_output>  outputs;
 
-   account_id_type fee_payer()const { return account_id_type{}; }
-
-   //account_id_type fee_payer()const { return from; }
+   account_id_type fee_payer()const { return from; }
    //void            validate()const;
    //share_type      calculate_fee(const fee_parameters_type& )const;
 };
@@ -181,9 +179,7 @@ struct transfer_from_blind_operation : public base_operation
    blind_factor_type     blinding_factor;
    vector<blind_input>   inputs;
 
-   account_id_type fee_payer()const { return account_id_type{}; }
-
-   //account_id_type fee_payer()const { return GRAPHENE_TEMP_ACCOUNT; }
+   account_id_type fee_payer()const { return GRAPHENE_TEMP_ACCOUNT; }
    //void            validate()const;
    //void            get_required_authorities( vector<authority>& a )const
    //{
@@ -246,10 +242,8 @@ struct blind_transfer_operation : public base_operation
    vector<blind_input>   inputs;
    vector<blind_output>  outputs;
 
-   account_id_type fee_payer()const { return account_id_type{}; }
-
    /** graphene TEMP account */
-   //account_id_type fee_payer()const;
+   account_id_type fee_payer()const { return GRAPHENE_TEMP_ACCOUNT; }
    //void            validate()const;
    //share_type      calculate_fee( const fee_parameters_type& k )const;
    //void            get_required_authorities( vector<authority>& a )const
