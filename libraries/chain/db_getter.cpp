@@ -305,16 +305,14 @@ bool database::is_son_dereg_valid( son_id_type son_id )
    }
 
    bool status_son_dereg_valid = true;
-   for(const auto& status : son->statuses)
-   {
-      const auto& sidechain = status.first;
-      if(status.second != son_status::in_maintenance)
+   for (const auto &active_sidechain_type : active_sidechain_types(head_block_time())) {
+      if(son->statuses.at(active_sidechain_type) != son_status::in_maintenance)
          status_son_dereg_valid = false;
 
       if(status_son_dereg_valid)
       {
-         if(son->statistics(*this).last_active_timestamp.contains(sidechain)) {
-            if (head_block_time() - son->statistics(*this).last_active_timestamp.at(sidechain) < fc::seconds(get_global_properties().parameters.son_deregister_time())) {
+         if(son->statistics(*this).last_active_timestamp.contains(active_sidechain_type)) {
+            if (head_block_time() - son->statistics(*this).last_active_timestamp.at(active_sidechain_type) < fc::seconds(get_global_properties().parameters.son_deregister_time())) {
                status_son_dereg_valid = false;
             }
          }
