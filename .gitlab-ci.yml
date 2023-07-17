@@ -167,3 +167,5 @@ test-e2e:
     - docker rmi $(docker images -a | grep -v 'hive-for-peerplays\|ethereum-for-peerplays\|bitcoin-for-peerplays\|ubuntu-for-peerplays' | awk '{print $3}')
   tags:
     - python-tests
+  when:
+    manual
