@@ -40,7 +40,7 @@ public:
     {
         fixture_.init_nathan();
         fixture_.generate_blocks(HARDFORK_SON_FOR_ETHEREUM_TIME);
-        fixture_.generate_block();
+        fixture_.generate_maintenance_block();
     }
 
     void create_son(const std::string& account_name, const std::string& son_url,
