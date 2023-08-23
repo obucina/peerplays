@@ -2283,7 +2283,7 @@ void database::perform_son_tasks()
             // Add vote_ids for HIVE and ETHEREUM to all existing SONs
             const auto &all_sons = get_index_type<son_index>().indices().get<by_id>();
             for (const son_object &son : all_sons) {
-               vote_id_type existing_vote_id_bitcoin;
+               const auto existing_vote_id_bitcoin = son.get_bitcoin_vote_id();
                vote_id_type new_vote_id_hive;
                vote_id_type new_vote_id_eth;
 
@@ -2300,7 +2300,7 @@ void database::perform_son_tasks()
                // Duplicate all votes from bitcoin to hive
                const auto &all_accounts = get_index_type<account_index>().indices().get<by_id>();
                for (const auto &account : all_accounts) {
-                  if (account.options.votes.count(existing_vote_id_bitcoin) != 0) {
+                  if (existing_vote_id_bitcoin.valid() && account.options.votes.count(*existing_vote_id_bitcoin) != 0) {
                      modify(account, [new_vote_id_hive](account_object &a) {
                         a.options.votes.insert(new_vote_id_hive);
                      });
