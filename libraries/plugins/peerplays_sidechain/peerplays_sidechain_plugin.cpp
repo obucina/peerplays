@@ -100,6 +100,7 @@ private:
    uint16_t retries_threshold = 150;
 
    bool first_block_skipped;
+   bool son_processing_enabled;
    void on_applied_block(const signed_block &b);
 };
 
@@ -135,7 +136,8 @@ peerplays_sidechain_plugin_impl::peerplays_sidechain_plugin_impl(peerplays_sidec
          }
          return net_handlers;
       }()),
-      first_block_skipped(false) {
+      first_block_skipped(false),
+      son_processing_enabled(false) {
 }
 
 peerplays_sidechain_plugin_impl::~peerplays_sidechain_plugin_impl() {
@@ -871,7 +873,19 @@ void peerplays_sidechain_plugin_impl::settle_sidechain_transactions(sidechain_ty
 
 void peerplays_sidechain_plugin_impl::on_applied_block(const signed_block &b) {
    if (first_block_skipped) {
-      schedule_son_processing();
+      if(son_processing_enabled) {
+         schedule_son_processing();
+      }
+      else
+      {
+         const fc::time_point now_fine = fc::time_point::now();
+         const fc::time_point_sec now = now_fine + fc::microseconds( 500000 );
+         if( plugin.database().get_slot_time(1) >= now )
+         {
+            son_processing_enabled = true;
+            schedule_son_processing();
+         }
+      }
    } else {
       first_block_skipped = true;
    }
