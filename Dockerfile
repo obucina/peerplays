@@ -134,11 +134,8 @@ RUN \
       libsodium-dev
 
 RUN \
-    git clone https://github.com/libbitcoin/libbitcoin-build.git && \
-    cd libbitcoin-build && \
-    git reset --hard 92c215fc1ffa272bab4d485d369d0306db52d69d && \
-    ./generate3.sh && \
-    cd ../libbitcoin-explorer && \
+    git clone --branch version3.8.0 --depth 1 https://gitlab.com/PBSA/peerplays-1.0/libbitcoin-explorer.git && \
+    cd libbitcoin-explorer && \
     ./install.sh && \
     ldconfig && \
     rm -rf /home/peerplays/src/*
